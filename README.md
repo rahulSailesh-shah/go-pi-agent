@@ -2,6 +2,8 @@
 
 A Go framework for building AI agents with tool execution, streaming responses, and event-driven architecture.
 
+> **Inspired by [pi-mono](https://github.com/badlogic/pi-mono)** - This project is a Go implementation inspired by Mario Zechner's excellent TypeScript AI agent toolkit. Full credit to [@badlogic](https://github.com/badlogic) for the original architecture and design patterns.
+
 ## Overview
 
 `go-pi-agent` provides a flexible foundation for creating specialized AI agents. It handles the complexities of LLM interaction, tool execution, and streaming, allowing you to focus on building your agent's specific capabilities.
