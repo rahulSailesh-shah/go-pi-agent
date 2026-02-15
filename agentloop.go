@@ -34,9 +34,7 @@ func sendEvent(ctx context.Context, ch chan<- AgentEvent, event AgentEvent) erro
 //	    // Handle events
 //	}
 //	result := <-stream.Result
-func AgentLoop(ctx context.Context,
-	prompts []AgentMessage,
-	agentContext AgentContext,
+func AgentLoop(ctx context.Context, prompts []AgentMessage, agentContext AgentContext,
 	config AgentLoopConfig) AgentEventStream {
 
 	stream := newAgentEventStream()
@@ -212,7 +210,8 @@ func runLoop(
 			var toolResults []AgentToolResult
 
 			if hasMoreToolCalls {
-				executionResults, err := executeToolCalls(ctx, currentContext.Tools, toolCalls, stream, config.GetSteeringMessages)
+				executionResults, err := executeToolCalls(ctx, currentContext.Tools, toolCalls, stream,
+					config.GetSteeringMessages)
 				if err != nil {
 					return err
 				}

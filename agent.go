@@ -410,19 +410,27 @@ func (a *Agent) Reset() {
 // The input can be a string, AgentMessage, or []AgentMessage.
 // Optional images can be attached when using a string input.
 //
+// The ctx parameter is used for cancellation and timeout control.
+// If ctx is cancelled, the agent will abort the current operation.
+//
 // Returns an error if the agent is already processing or no model is configured.
 //
 // Example:
 //
 //	// Simple string prompt
-//	err := agent.Prompt("What is the weather?")
+//	err := agent.Prompt(context.Background(), "What is the weather?")
+//
+//	// With timeout
+//	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//	defer cancel()
+//	err := agent.Prompt(ctx, "What is the weather?")
 //
 //	// With images
-//	err := agent.Prompt("Describe this image", imageContent)
+//	err := agent.Prompt(context.Background(), "Describe this image", imageContent)
 //
 //	// With custom message
-//	err := agent.Prompt(types.UserMessage{...})
-func (a *Agent) Prompt(input interface{}, images ...types.ImageContent) error {
+//	err := agent.Prompt(context.Background(), types.UserMessage{...})
+func (a *Agent) Prompt(ctx context.Context, input interface{}, images ...types.ImageContent) error {
 	a.mu.RLock()
 	if a.state.IsStreaming {
 		a.mu.RUnlock()
@@ -460,15 +468,18 @@ func (a *Agent) Prompt(input interface{}, images ...types.ImageContent) error {
 		return errors.New("invalid input type for Prompt")
 	}
 
-	return a.runLoop(msgs)
+	return a.runLoop(ctx, msgs)
 }
 
 // Continue continues from the current context without adding a new message.
 // This is useful for retrying after an error or continuing after tool results.
 //
+// The ctx parameter is used for cancellation and timeout control.
+// If ctx is cancelled, the agent will abort the current operation.
+//
 // Returns an error if the agent is already processing, there are no messages,
 // or the last message is from the assistant.
-func (a *Agent) Continue() error {
+func (a *Agent) Continue(ctx context.Context) error {
 	a.mu.RLock()
 	if a.state.IsStreaming {
 		a.mu.RUnlock()
@@ -487,11 +498,11 @@ func (a *Agent) Continue() error {
 		return errors.New("cannot continue from message role: assistant")
 	}
 
-	return a.runLoop(nil)
+	return a.runLoop(ctx, nil)
 }
 
 // runLoop runs the agent loop with optional new messages.
-func (a *Agent) runLoop(messages []AgentMessage) error {
+func (a *Agent) runLoop(ctx context.Context, messages []AgentMessage) error {
 	a.mu.RLock()
 	model := a.state.Model
 	a.mu.RUnlock()
@@ -506,8 +517,11 @@ func (a *Agent) runLoop(messages []AgentMessage) error {
 	a.runningPrompt = done
 	a.runningPromptMu.Unlock()
 
-	// Create context for cancellation
-	ctx, cancel := context.WithCancel(context.Background())
+	// Create context for cancellation that respects the provided context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
 	a.abortCancelMu.Lock()
 	a.abortCancel = cancel
 	a.abortCancelMu.Unlock()

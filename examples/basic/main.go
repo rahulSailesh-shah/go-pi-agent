@@ -26,8 +26,8 @@ import (
 	"sync"
 	"time"
 
-	agent "github.com/rahulSailesh-shah/go-pi-agent"
 	"github.com/joho/godotenv"
+	agent "github.com/rahulSailesh-shah/go-pi-agent"
 	"github.com/rahulSailesh-shah/go-pi-ai/provider"
 	"github.com/rahulSailesh-shah/go-pi-ai/types"
 )
@@ -182,7 +182,7 @@ func RunAgentExample() {
 
 	// Send a prompt
 	fmt.Println("=== Sending prompt: What is the weather in Tokyo, Japan? ===")
-	err = myAgent.Prompt("What is the weather in Tokyo, Japan?")
+	err = myAgent.Prompt(context.Background(), "What is the weather in Tokyo, Japan?")
 	if err != nil {
 		log.Fatalf("Failed to send prompt: %v", err)
 	}
@@ -205,6 +205,70 @@ func RunAgentExample() {
 		log.Fatalf("Failed to marshal messages: %v", err)
 	}
 	fmt.Printf("\nFinal messages:\n%s\n", string(data))
+}
+
+// RunAgentWithTimeoutExample demonstrates using context with timeout.
+func RunAgentWithTimeoutExample() {
+	tools := createTools()
+
+	// Get the model
+	model, err := provider.GetModel(types.ProviderNvidia, "openai/gpt-oss-20b")
+	if err != nil {
+		log.Fatalf("Failed to get model: %v", err)
+	}
+
+	// Create the Agent with initial state
+	myAgent := agent.NewAgent(&agent.AgentOptions{
+		InitialState: &agent.AgentState{
+			SystemPrompt: "You are a helpful assistant. Answer the user's query and use tools if needed.",
+			Model:        model,
+			Tools:        tools,
+		},
+		SteeringMode: "one-at-a-time",
+		FollowUpMode: "one-at-a-time",
+	})
+
+	// Subscribe to events
+	unsubscribe := myAgent.Subscribe(func(e agent.AgentEvent) {
+		switch ev := e.(type) {
+		case agent.MessageUpdate:
+			switch inner := ev.AssistantMessageEvent.(type) {
+			case types.EventTextDelta:
+				fmt.Print(inner.Delta)
+			case types.EventDone:
+				fmt.Printf("\n[Stream Done (Reason: %s)]\n", inner.Reason)
+			}
+		case agent.AgentEnd:
+			fmt.Printf("\n[Agent End]\n")
+		}
+	})
+	defer unsubscribe()
+
+	// Create a context with 10 second timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Send a prompt with timeout
+	fmt.Println("=== Sending prompt with 10s timeout: What is the meaning of life? ===")
+	err = myAgent.Prompt(ctx, "What is the meaning of life? Please provide a very detailed philosophical answer.")
+	if err != nil {
+		log.Printf("Prompt failed or timed out: %v", err)
+	}
+
+	// Wait for the agent to finish or timeout
+	select {
+	case <-myAgent.WaitForIdle():
+		fmt.Println("\n=== Agent completed normally ===")
+	case <-ctx.Done():
+		fmt.Println("\n=== Context cancelled (timeout) ===")
+		myAgent.Abort() // Ensure agent is stopped
+	}
+
+	// Get the final state
+	state := myAgent.State()
+	if state.Error != nil {
+		fmt.Printf("Error: %s\n", *state.Error)
+	}
 }
 
 // createTools returns a list of example tools for demonstration.
@@ -264,9 +328,12 @@ func createTools() []agent.AgentTool {
 }
 
 func main() {
-	// Uncomment to run the low-level AgentLoop example:
+	// low-level AgentLoop example:
 	// RunAgentLoopExample()
 
 	// Run the high-level Agent example (recommended):
-	RunAgentExample()
+	// RunAgentExample()
+
+	// Run the timeout example:
+	// RunAgentWithTimeoutExample()
 }
