@@ -1,43 +1,24 @@
-// Package main demonstrates basic usage of the go-pi-agent package.
-//
-// This example shows how to:
-//   - Create an agent with tools
-//   - Subscribe to events for streaming responses
-//   - Send prompts and wait for completion
-//
-// To run this example from the project root:
-//
-//	go run ./examples/basic
-//
-// Or from the examples/basic directory (with .env in project root):
-//
-//	go run main.go
-//
-// Make sure to set the required environment variables for your LLM provider.
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
 	agent "github.com/rahulSailesh-shah/go-pi-agent"
-	"github.com/rahulSailesh-shah/go-pi-ai/provider"
-	"github.com/rahulSailesh-shah/go-pi-ai/types"
+	"github.com/rahulSailesh-shah/go-pi-ai/openai"
 )
 
 func init() {
-	// Try to load .env from current directory first
 	if err := godotenv.Load(); err != nil {
-		// If not found, try to find it in parent directories (for running from examples/basic)
 		dir, _ := os.Getwd()
-		for i := 0; i < 3; i++ { // Check up to 3 parent directories
+		for i := 0; i < 3; i++ {
 			envPath := filepath.Join(dir, ".env")
 			if _, err := os.Stat(envPath); err == nil {
 				godotenv.Load(envPath)
@@ -48,15 +29,27 @@ func init() {
 	}
 }
 
-// RunAgentLoopExample demonstrates the low-level AgentLoop API.
-// This provides direct control over the agent execution loop.
+// getProvider creates an OpenAI-compatible provider.
+func getProvider() agent.Provider {
+	provider, err := openai.NewProvider(openai.Config{
+		APIKey:  os.Getenv("NVIDIA_API_KEY"),
+		BaseURL: "https://integrate.api.nvidia.com/v1",
+	})
+	if err != nil {
+		log.Fatalf("Failed to create provider: %v", err)
+	}
+	return provider
+}
+
+// RunAgentLoopExample demonstrates the low-level AgentLoop API
+// using the Stream iterator (Recv/Close) pattern.
 func RunAgentLoopExample() {
 	ctx := context.Background()
-	prompts := []agent.AgentMessage{
-		types.UserMessage{
+	prompts := []agent.Message{
+		agent.UserMessage{
 			Timestamp: time.Now(),
-			Contents: []types.Content{
-				types.TextContent{Text: "What is the weather in Tokyo, Japan?"},
+			Contents: []agent.Content{
+				agent.TextContent{Text: "What is the weather in Tokyo, Japan?"},
 			},
 		},
 	}
@@ -68,110 +61,78 @@ func RunAgentLoopExample() {
 		Tools:        tools,
 	}
 
-	model, err := provider.GetModel(types.ProviderNvidia, "openai/gpt-oss-20b")
-	if err != nil {
-		log.Fatalf("Failed to get model: %v", err)
+	config := agent.AgentLoopConfig{
+		Model:               getProvider(),
+		ModelName:           "openai/gpt-oss-20b",
+		GetSteeringMessages: func() ([]agent.Message, error) { return nil, nil },
+		GetFollowUpMessages: func() ([]agent.Message, error) { return nil, nil },
 	}
 
-	agentLoopConfig := agent.AgentLoopConfig{
-		Model: model,
-		GetSteeringMessages: func() ([]agent.AgentMessage, error) {
-			return []agent.AgentMessage{}, nil
-		},
-		GetFollowUpMessages: func() ([]agent.AgentMessage, error) {
-			return []agent.AgentMessage{}, nil
-		},
-	}
+	stream := agent.AgentLoop(ctx, prompts, agentContext, config)
+	defer stream.Close()
 
-	stream := agent.AgentLoop(ctx, prompts, agentContext, agentLoopConfig)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for event := range stream.Events {
-			fmt.Printf("[DEBUG] Received event type: %T\n", event)
-			switch e := event.(type) {
-			case agent.MessageUpdate:
-				switch inner := e.AssistantMessageEvent.(type) {
-				case types.EventStart:
-					fmt.Printf("\n[Stream Start]\n")
-				case types.EventTextStart:
-					// Start of a text block
-				case types.EventTextDelta:
-					fmt.Print(inner.Delta)
-				case types.EventTextEnd:
-					// End of a text block
-				case types.EventToolcallStart:
-					fmt.Printf("\n[Tool Call Start]\n")
-				case types.EventToolcallEnd:
-					fmt.Printf("\n[Tool Call End]\n")
-				case types.EventDone:
-					fmt.Printf("\n[Stream Done (Reason: %s)]\n", inner.Reason)
-				default:
-					fmt.Printf("[DEBUG] Unhandled inner event: %T\n", inner)
-				}
-			}
+	var finalMessages []agent.Message
+
+	for {
+		event, err := stream.Recv()
+		if err == io.EOF {
+			break
 		}
-		fmt.Println()
-	}()
-
-	fmt.Println("[DEBUG] Waiting for stream result/error")
-	var finalMessage []agent.AgentMessage
-	select {
-	case finalMessage = <-stream.Result:
-		fmt.Println("[DEBUG] Got result")
-	case err := <-stream.Err:
 		if err != nil {
 			log.Fatalf("Error from stream: %v", err)
 		}
+
+		switch e := event.(type) {
+		case agent.MessageUpdate:
+			switch inner := e.Event.(type) {
+			case agent.EventTextDelta:
+				fmt.Print(inner.Delta)
+			case agent.EventToolcallStart:
+				fmt.Printf("\n[Tool Call Start]\n")
+			case agent.EventToolcallEnd:
+				fmt.Printf("\n[Tool Call End]\n")
+			case agent.EventDone:
+				fmt.Printf("\n[Stream Done (Reason: %s)]\n", inner.Reason)
+			}
+		case agent.AgentEnd:
+			finalMessages = e.Messages
+		}
 	}
 
-	wg.Wait()
-	fmt.Println("[DEBUG] Events drained")
-	data, err := json.MarshalIndent(finalMessage, "", "  ")
+	fmt.Println()
+	data, err := json.MarshalIndent(finalMessages, "", "  ")
 	if err != nil {
-		log.Fatalf("Failed to marshal final message: %v", err)
+		log.Fatalf("Failed to marshal final messages: %v", err)
 	}
-	log.Printf("Final message: %s", string(data))
+	log.Printf("Final messages: %s", string(data))
 }
 
 // RunAgentExample demonstrates the high-level Agent API.
-// This is the recommended way to use the package for most use cases.
 func RunAgentExample() {
 	tools := createTools()
 
-	// Get the model
-	model, err := provider.GetModel(types.ProviderNvidia, "openai/gpt-oss-20b")
-	if err != nil {
-		log.Fatalf("Failed to get model: %v", err)
-	}
-
-	// Create the Agent with initial state
 	myAgent := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.AgentState{
 			SystemPrompt: "You are a helpful assistant. Answer the user's query and use tools if needed.",
-			Model:        model,
+			Model:        getProvider(),
+			ModelName:    "openai/gpt-oss-20b",
 			Tools:        tools,
 		},
 		SteeringMode: "one-at-a-time",
 		FollowUpMode: "one-at-a-time",
 	})
 
-	// Subscribe to events
 	unsubscribe := myAgent.Subscribe(func(e agent.AgentEvent) {
-		fmt.Printf("[AGENT] Event: %T\n", e)
 		switch ev := e.(type) {
 		case agent.MessageUpdate:
-			switch inner := ev.AssistantMessageEvent.(type) {
-			case types.EventStart:
-				fmt.Printf("\n[Stream Start]\n")
-			case types.EventTextDelta:
+			switch inner := ev.Event.(type) {
+			case agent.EventTextDelta:
 				fmt.Print(inner.Delta)
-			case types.EventToolcallStart:
+			case agent.EventToolcallStart:
 				fmt.Printf("\n[Tool Call Start]\n")
-			case types.EventToolcallEnd:
+			case agent.EventToolcallEnd:
 				fmt.Printf("\n[Tool Call End]\n")
-			case types.EventDone:
+			case agent.EventDone:
 				fmt.Printf("\n[Stream Done (Reason: %s)]\n", inner.Reason)
 			}
 		case agent.AgentEnd:
@@ -180,26 +141,21 @@ func RunAgentExample() {
 	})
 	defer unsubscribe()
 
-	// Send a prompt
 	fmt.Println("=== Sending prompt: What is the weather in Tokyo, Japan? ===")
-	err = myAgent.Prompt(context.Background(), "What is the weather in Tokyo, Japan?")
+	err := myAgent.Prompt(context.Background(), "What is the weather in Tokyo, Japan?")
 	if err != nil {
 		log.Fatalf("Failed to send prompt: %v", err)
 	}
 
-	// Wait for the agent to finish
 	<-myAgent.WaitForIdle()
 
-	// Get the final state
 	state := myAgent.State()
 	fmt.Printf("\n=== Agent finished ===\n")
 	fmt.Printf("Messages count: %d\n", len(state.Messages))
-	fmt.Printf("Is streaming: %v\n", state.IsStreaming)
 	if state.Error != nil {
 		fmt.Printf("Error: %s\n", *state.Error)
 	}
 
-	// Print all messages
 	data, err := json.MarshalIndent(state.Messages, "", "  ")
 	if err != nil {
 		log.Fatalf("Failed to marshal messages: %v", err)
@@ -211,31 +167,22 @@ func RunAgentExample() {
 func RunAgentWithTimeoutExample() {
 	tools := createTools()
 
-	// Get the model
-	model, err := provider.GetModel(types.ProviderNvidia, "openai/gpt-oss-20b")
-	if err != nil {
-		log.Fatalf("Failed to get model: %v", err)
-	}
-
-	// Create the Agent with initial state
 	myAgent := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.AgentState{
 			SystemPrompt: "You are a helpful assistant. Answer the user's query and use tools if needed.",
-			Model:        model,
+			Model:        getProvider(),
+			ModelName:    "openai/gpt-oss-20b",
 			Tools:        tools,
 		},
-		SteeringMode: "one-at-a-time",
-		FollowUpMode: "one-at-a-time",
 	})
 
-	// Subscribe to events
 	unsubscribe := myAgent.Subscribe(func(e agent.AgentEvent) {
 		switch ev := e.(type) {
 		case agent.MessageUpdate:
-			switch inner := ev.AssistantMessageEvent.(type) {
-			case types.EventTextDelta:
+			switch inner := ev.Event.(type) {
+			case agent.EventTextDelta:
 				fmt.Print(inner.Delta)
-			case types.EventDone:
+			case agent.EventDone:
 				fmt.Printf("\n[Stream Done (Reason: %s)]\n", inner.Reason)
 			}
 		case agent.AgentEnd:
@@ -244,38 +191,33 @@ func RunAgentWithTimeoutExample() {
 	})
 	defer unsubscribe()
 
-	// Create a context with 10 second timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Send a prompt with timeout
-	fmt.Println("=== Sending prompt with 10s timeout: What is the meaning of life? ===")
-	err = myAgent.Prompt(ctx, "What is the meaning of life? Please provide a very detailed philosophical answer.")
+	fmt.Println("=== Sending prompt with 10s timeout ===")
+	err := myAgent.Prompt(ctx, "What is the meaning of life? Please provide a very detailed philosophical answer.")
 	if err != nil {
-		log.Printf("Prompt failed or timed out: %v", err)
+		log.Printf("Prompt failed: %v", err)
 	}
 
-	// Wait for the agent to finish or timeout
 	select {
 	case <-myAgent.WaitForIdle():
 		fmt.Println("\n=== Agent completed normally ===")
 	case <-ctx.Done():
 		fmt.Println("\n=== Context cancelled (timeout) ===")
-		myAgent.Abort() // Ensure agent is stopped
+		myAgent.Abort()
 	}
 
-	// Get the final state
 	state := myAgent.State()
 	if state.Error != nil {
 		fmt.Printf("Error: %s\n", *state.Error)
 	}
 }
 
-// createTools returns a list of example tools for demonstration.
 func createTools() []agent.AgentTool {
 	return []agent.AgentTool{
 		{
-			Tool: types.Tool{
+			Tool: agent.Tool{
 				Name:        "getWeather",
 				Description: "Get the weather for a given location",
 				Parameters: map[string]any{
@@ -287,20 +229,19 @@ func createTools() []agent.AgentTool {
 				},
 			},
 			Label: "getWeather",
-			Execute: func(toolCallId string, params map[string]any) (agent.AgentToolResult, error) {
-				return agent.AgentToolResult{
-					ToolCallId: toolCallId,
+			Execute: func(toolCallID string, params map[string]any) (agent.ToolMessage, error) {
+				return agent.ToolMessage{
+					ToolCallID: toolCallID,
 					ToolName:   "getWeather",
-					Contents: []types.Content{
-						types.TextContent{Text: "Weather in Tokyo, Japan: 72F (22C), partly cloudy"},
+					Contents: []agent.Content{
+						agent.TextContent{Text: "Weather in Tokyo, Japan: 72F (22C), partly cloudy"},
 					},
-					IsError:   false,
 					Timestamp: time.Now(),
 				}, nil
 			},
 		},
 		{
-			Tool: types.Tool{
+			Tool: agent.Tool{
 				Name:        "getStockPrice",
 				Description: "Get the stock price for a given company",
 				Parameters: map[string]any{
@@ -312,14 +253,13 @@ func createTools() []agent.AgentTool {
 				},
 			},
 			Label: "getStockPrice",
-			Execute: func(toolCallId string, params map[string]any) (agent.AgentToolResult, error) {
-				return agent.AgentToolResult{
-					ToolCallId: toolCallId,
+			Execute: func(toolCallID string, params map[string]any) (agent.ToolMessage, error) {
+				return agent.ToolMessage{
+					ToolCallID: toolCallID,
 					ToolName:   "getStockPrice",
-					Contents: []types.Content{
-						types.TextContent{Text: "Stock price for Apple: $150.75"},
+					Contents: []agent.Content{
+						agent.TextContent{Text: "Stock price for Apple: $150.75"},
 					},
-					IsError:   false,
 					Timestamp: time.Now(),
 				}, nil
 			},
@@ -328,12 +268,14 @@ func createTools() []agent.AgentTool {
 }
 
 func main() {
-	// low-level AgentLoop example:
+	// Uncomment the example you want to run:
+
+	// Low-level AgentLoop example:
 	// RunAgentLoopExample()
 
-	// Run the high-level Agent example (recommended):
-	// RunAgentExample()
+	// High-level Agent example (recommended):
+	RunAgentExample()
 
-	// Run the timeout example:
+	// Timeout example:
 	// RunAgentWithTimeoutExample()
 }

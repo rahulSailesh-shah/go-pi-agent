@@ -1,273 +1,241 @@
 package agent
 
 import (
-	"github.com/rahulSailesh-shah/go-pi-ai/provider"
-	"github.com/rahulSailesh-shah/go-pi-ai/types"
+	"context"
+	"io"
+	"sync"
+
+	gopiai "github.com/rahulSailesh-shah/go-pi-ai"
 )
 
-// AgentMessage is an alias for types.Message, representing any message in the conversation.
-// Messages can be from the user, assistant, or tool.
-type AgentMessage = types.Message
+// Re-export gopiai types so consumers only need to import the agent package.
+type (
+	Message          = gopiai.Message
+	Content          = gopiai.Content
+	TextContent      = gopiai.TextContent
+	ImageContent     = gopiai.ImageContent
+	ToolCall         = gopiai.ToolCall
+	UserMessage      = gopiai.UserMessage
+	AssistantMessage = gopiai.AssistantMessage
+	ToolMessage      = gopiai.ToolMessage
+	Tool             = gopiai.Tool
+	StopReason       = gopiai.StopReason
+	Provider         = gopiai.Provider
+	Request          = gopiai.Request
+)
 
-// AgentToolResult is an alias for types.ToolMessage, representing the result of a tool execution.
-type AgentToolResult = types.ToolMessage
+// Re-export gopiai streaming event types.
+type (
+	Event              = gopiai.Event
+	EventStart         = gopiai.EventStart
+	EventTextStart     = gopiai.EventTextStart
+	EventTextDelta     = gopiai.EventTextDelta
+	EventTextEnd       = gopiai.EventTextEnd
+	EventToolcallStart = gopiai.EventToolcallStart
+	EventToolcallDelta = gopiai.EventToolcallDelta
+	EventToolcallEnd   = gopiai.EventToolcallEnd
+	EventDone          = gopiai.EventDone
+	EventError         = gopiai.EventError
+)
+
+// Re-export gopiai stop reason constants.
+var (
+	StopReasonStop    = gopiai.StopReasonStop
+	StopReasonLength  = gopiai.StopReasonLength
+	StopReasonToolUse = gopiai.StopReasonToolUse
+	StopReasonAborted = gopiai.StopReasonAborted
+	StopReasonError   = gopiai.StopReasonError
+	StopReasonUnknown = gopiai.StopReasonUnknown
+)
 
 // AgentTool defines a tool that can be executed by the agent.
 // It combines the tool schema (Name, Description, Parameters) with
 // an Execute function that performs the actual work.
-//
-// Example:
-//
-//	tool := AgentTool{
-//	    Tool: types.Tool{
-//	        Name:        "getWeather",
-//	        Description: "Get the weather for a location",
-//	        Parameters: map[string]any{
-//	            "type": "object",
-//	            "properties": map[string]any{
-//	                "location": map[string]string{"type": "string"},
-//	            },
-//	            "required": []string{"location"},
-//	        },
-//	    },
-//	    Label: "Weather",
-//	    Execute: func(toolCallId string, params map[string]any) (AgentToolResult, error) {
-//	        location := params["location"].(string)
-//	        // Fetch weather...
-//	        return types.ToolMessage{
-//	            ToolCallId: toolCallId,
-//	            ToolName:   "getWeather",
-//	            Contents:   []types.Content{types.TextContent{Text: "Sunny, 72F"}},
-//	        }, nil
-//	    },
-//	}
 type AgentTool struct {
-	types.Tool
+	gopiai.Tool
 
-	// Label is a human-readable label for the tool (optional).
-	// This can be used for UI display purposes.
+	// Label is an optional human-readable label for UI display.
 	Label string
 
 	// Execute is called when the LLM requests this tool.
 	// It receives the tool call ID (for tracking) and the parsed arguments.
-	// Returns the tool result or an error.
-	Execute func(toolCallId string, params map[string]any) (AgentToolResult, error)
+	// Returns the tool result message or an error.
+	Execute func(toolCallID string, params map[string]any) (ToolMessage, error)
 }
 
 // AgentContext holds the context for an agent loop execution.
-// It contains the system prompt, conversation history, and available tools.
 type AgentContext struct {
-	// SystemPrompt is the initial instruction given to the LLM.
 	SystemPrompt string
-
-	// Messages is the conversation history.
-	Messages []AgentMessage
-
-	// Tools is the list of tools available for execution.
-	Tools []AgentTool
+	Messages     []Message
+	Tools        []AgentTool
 }
 
 // AgentLoopConfig configures the behavior of the agent loop.
 type AgentLoopConfig struct {
-	// Model is the LLM provider to use for generating responses.
-	Model provider.Provider
+	// Model is the LLM provider used for generating responses.
+	Model gopiai.Provider
 
-	// SessionId is an optional identifier for the conversation session.
-	SessionId string
+	// ModelName is the model identifier (e.g. "gpt-4o").
+	ModelName string
+
+	// SessionID is an optional identifier for the conversation session.
+	SessionID string
 
 	// GetSteeringMessages is called during execution to check for steering messages.
 	// Steering messages can interrupt tool execution to redirect the agent.
-	// Return nil or empty slice if no steering messages are available.
-	GetSteeringMessages func() ([]AgentMessage, error)
+	// Return nil if no steering messages are available.
+	GetSteeringMessages func() ([]Message, error)
 
 	// GetFollowUpMessages is called after the agent completes to check for follow-up messages.
 	// Follow-up messages are processed in a new turn after the current execution completes.
-	// Return nil or empty slice if no follow-up messages are available.
-	GetFollowUpMessages func() ([]AgentMessage, error)
+	// Return nil if no follow-up messages are available.
+	GetFollowUpMessages func() ([]Message, error)
 }
 
-// AgentEventStream provides channels for receiving agent events, results, and errors.
-// Events are streamed in real-time as the agent processes.
-type AgentEventStream struct {
-	// Events channel receives all agent events during execution.
-	// The channel is closed when the agent completes or encounters an error.
-	Events chan AgentEvent
+// Stream provides an iterator-based API for consuming agent events.
+// Call Recv() in a loop until it returns io.EOF (complete) or an error.
+// Always call Close() when done (use defer).
+type Stream struct {
+	events chan AgentEvent
+	cancel context.CancelFunc
+	ctx    context.Context
+	once   sync.Once
+	err    error
+}
 
-	// Result channel receives the final list of new messages when the agent completes successfully.
-	// This is a buffered channel with capacity 1.
-	Result chan []AgentMessage
+// NewStream creates a new Stream. The provided context is used for cancellation.
+// Close() also cancels the stream's context.
+// Returns the stream and a send-only channel for the producer.
+func NewStream(ctx context.Context) (*Stream, chan<- AgentEvent) {
+	ctx, cancel := context.WithCancel(ctx)
+	ch := make(chan AgentEvent)
+	s := &Stream{
+		events: ch,
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	return s, ch
+}
 
-	// Err channel receives any error that occurs during execution.
-	// This is a buffered channel with capacity 1.
-	Err chan error
+// Recv returns the next event from the stream.
+// Returns io.EOF when the stream is complete.
+func (s *Stream) Recv() (AgentEvent, error) {
+	event, ok := <-s.events
+	if !ok {
+		if s.err != nil {
+			return nil, s.err
+		}
+		return nil, io.EOF
+	}
+	if e, ok := event.(AgentError); ok {
+		s.err = e.Error
+		return nil, e.Error
+	}
+	return event, nil
+}
+
+// Close signals that the consumer is done reading and releases resources.
+func (s *Stream) Close() error {
+	s.once.Do(func() {
+		s.cancel()
+		for range s.events {
+		}
+	})
+	return nil
+}
+
+// Context returns the stream's context. Producers should select on
+// ctx.Done() to detect cancellation from Close() or the parent context.
+func (s *Stream) Context() context.Context {
+	return s.ctx
 }
 
 // AgentEvent is the interface implemented by all agent events.
-// Events are emitted during agent execution to track progress and state changes.
 type AgentEvent interface {
-	isAssistantMessageEvent()
-
-	// Type returns the event type as a string (e.g., "agent_start", "message_update").
+	agentEvent()
 	Type() string
 }
 
 // AgentStart is emitted when the agent begins processing.
 type AgentStart struct{}
 
-func (e AgentStart) isAssistantMessageEvent() {}
-
-// Type returns "agent_start".
-func (e AgentStart) Type() string {
-	return "agent_start"
-}
+func (e AgentStart) agentEvent()  {}
+func (e AgentStart) Type() string { return "agent_start" }
 
 // AgentEnd is emitted when the agent completes processing.
-// It contains all new messages generated during this execution.
 type AgentEnd struct {
-	// Messages contains all new messages generated during this agent run.
-	Messages []AgentMessage
+	Messages []Message
 }
 
-func (e AgentEnd) isAssistantMessageEvent() {}
+func (e AgentEnd) agentEvent()  {}
+func (e AgentEnd) Type() string { return "agent_end" }
 
-// Type returns "agent_end".
-func (e AgentEnd) Type() string {
-	return "agent_end"
+// AgentError is emitted when the agent encounters an error.
+// When received via Recv(), it is returned as the error value (not as an event).
+type AgentError struct {
+	Error error
 }
+
+func (e AgentError) agentEvent()  {}
+func (e AgentError) Type() string { return "agent_error" }
 
 // TurnStart is emitted at the beginning of each turn.
-// A turn consists of an LLM response and any subsequent tool executions.
 type TurnStart struct{}
 
-func (e TurnStart) isAssistantMessageEvent() {}
-
-// Type returns "turn_start".
-func (e TurnStart) Type() string {
-	return "turn_start"
-}
+func (e TurnStart) agentEvent()  {}
+func (e TurnStart) Type() string { return "turn_start" }
 
 // TurnEnd is emitted at the end of each turn.
-// It contains the assistant message and any tool results from this turn.
 type TurnEnd struct {
-	// Message is the assistant's response for this turn.
-	Message AgentMessage
-
-	// ToolResults contains the results of any tools executed during this turn.
-	ToolResults []AgentToolResult
+	Message     Message
+	ToolResults []ToolMessage
 }
 
-func (e TurnEnd) isAssistantMessageEvent() {}
-
-// Type returns "turn_end".
-func (e TurnEnd) Type() string {
-	return "turn_end"
-}
+func (e TurnEnd) agentEvent()  {}
+func (e TurnEnd) Type() string { return "turn_end" }
 
 // MessageStart is emitted when a new message begins.
-// This is emitted for user messages, assistant messages, and tool results.
 type MessageStart struct {
-	// Message is the message that is starting.
-	Message AgentMessage
+	Message Message
 }
 
-func (e MessageStart) isAssistantMessageEvent() {}
+func (e MessageStart) agentEvent()  {}
+func (e MessageStart) Type() string { return "message_start" }
 
-// Type returns "message_start".
-func (e MessageStart) Type() string {
-	return "message_start"
-}
-
-// MessageUpdate is emitted during streaming to provide partial message content.
-// This event contains both the partial message and the underlying LLM event.
+// MessageUpdate is emitted during streaming to provide partial content.
 type MessageUpdate struct {
-	// Message is the partial message with content received so far.
-	Message AgentMessage
-
-	// AssistantMessageEvent is the underlying event from the LLM provider.
-	// This can be used to access detailed streaming information like text deltas.
-	AssistantMessageEvent types.AssistantMessageEvent
+	Message Message
+	Event   gopiai.Event
 }
 
-func (e MessageUpdate) isAssistantMessageEvent() {}
-
-// Type returns "message_update".
-func (e MessageUpdate) Type() string {
-	return "message_update"
-}
+func (e MessageUpdate) agentEvent()  {}
+func (e MessageUpdate) Type() string { return "message_update" }
 
 // MessageEnd is emitted when a message is complete.
 type MessageEnd struct {
-	// Message is the complete message.
-	Message AgentMessage
+	Message Message
 }
 
-func (e MessageEnd) isAssistantMessageEvent() {}
-
-// Type returns "message_end".
-func (e MessageEnd) Type() string {
-	return "message_end"
-}
+func (e MessageEnd) agentEvent()  {}
+func (e MessageEnd) Type() string { return "message_end" }
 
 // ToolExecutionStart is emitted when a tool begins execution.
 type ToolExecutionStart struct {
-	// ToolCallId is the unique identifier for this tool call.
-	ToolCallId string
-
-	// ToolName is the name of the tool being executed.
-	ToolName string
-
-	// Args contains the arguments passed to the tool.
-	Args map[string]any
+	ToolCallID string
+	ToolName   string
+	Args       map[string]any
 }
 
-func (e ToolExecutionStart) isAssistantMessageEvent() {}
-
-// Type returns "tool_execution_start".
-func (e ToolExecutionStart) Type() string {
-	return "tool_execution_start"
-}
-
-// ToolExecutionUpdate is emitted during tool execution to provide progress updates.
-// This is optional and depends on the tool implementation.
-type ToolExecutionUpdate struct {
-	// ToolCallId is the unique identifier for this tool call.
-	ToolCallId string
-
-	// ToolName is the name of the tool being executed.
-	ToolName string
-
-	// Args contains the arguments passed to the tool.
-	Args map[string]any
-
-	// PartialResult contains any partial result from the tool.
-	PartialResult any
-}
-
-func (e ToolExecutionUpdate) isAssistantMessageEvent() {}
-
-// Type returns "tool_execution_update".
-func (e ToolExecutionUpdate) Type() string {
-	return "tool_execution_update"
-}
+func (e ToolExecutionStart) agentEvent()  {}
+func (e ToolExecutionStart) Type() string { return "tool_execution_start" }
 
 // ToolExecutionEnd is emitted when a tool completes execution.
 type ToolExecutionEnd struct {
-	// ToolCallId is the unique identifier for this tool call.
-	ToolCallId string
-
-	// ToolName is the name of the tool that was executed.
-	ToolName string
-
-	// Result contains the tool execution result.
-	Result any
-
-	// IsError indicates whether the tool execution resulted in an error.
-	IsError bool
+	ToolCallID string
+	ToolName   string
+	Result     any
+	IsError    bool
 }
 
-func (e ToolExecutionEnd) isAssistantMessageEvent() {}
-
-// Type returns "tool_execution_end".
-func (e ToolExecutionEnd) Type() string {
-	return "tool_execution_end"
-}
+func (e ToolExecutionEnd) agentEvent()  {}
+func (e ToolExecutionEnd) Type() string { return "tool_execution_end" }

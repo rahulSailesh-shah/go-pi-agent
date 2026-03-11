@@ -1,28 +1,35 @@
 // Package agent provides a framework for building AI agents with tool execution,
 // streaming responses, and event-driven architecture.
 //
-// This package is designed to be used as a core building block for creating
-// specialized AI agents in other projects. It provides both high-level and
-// low-level APIs for different use cases.
+// This package is designed as a core building block for creating specialized
+// AI agents. It provides both high-level and low-level APIs.
 //
 // # Overview
 //
 // The package offers two main APIs:
 //
 //   - High-level API: The [Agent] struct provides state management, event subscription,
-//     and lifecycle control. This is recommended for most use cases.
+//     and lifecycle control. Recommended for most use cases.
 //
 //   - Low-level API: The [AgentLoop] function provides direct control over the
 //     execution loop for advanced use cases.
 //
 // # Quick Start
 //
-// Here's a minimal example using the high-level API:
+//	import (
+//	    agent "github.com/rahulSailesh-shah/go-pi-agent"
+//	    "github.com/rahulSailesh-shah/go-pi-ai/openai"
+//	)
 //
-//	// Create tools
+//	// Create a provider
+//	provider, _ := openai.NewProvider(openai.Config{
+//	    APIKey: os.Getenv("OPENAI_API_KEY"),
+//	})
+//
+//	// Define tools
 //	tools := []agent.AgentTool{
 //	    {
-//	        Tool: types.Tool{
+//	        Tool: agent.Tool{
 //	            Name:        "getWeather",
 //	            Description: "Get the weather for a location",
 //	            Parameters: map[string]any{
@@ -33,25 +40,22 @@
 //	                "required": []string{"location"},
 //	            },
 //	        },
-//	        Execute: func(toolCallId string, params map[string]any) (agent.AgentToolResult, error) {
-//	            // Implement tool logic here
-//	            return types.ToolMessage{
-//	                ToolCallId: toolCallId,
+//	        Execute: func(toolCallID string, params map[string]any) (agent.ToolMessage, error) {
+//	            return agent.ToolMessage{
+//	                ToolCallID: toolCallID,
 //	                ToolName:   "getWeather",
-//	                Contents:   []types.Content{types.TextContent{Text: "Sunny, 72F"}},
+//	                Contents:   []agent.Content{agent.TextContent{Text: "Sunny, 72F"}},
 //	            }, nil
 //	        },
 //	    },
 //	}
 //
-//	// Get a model provider
-//	model, _ := provider.GetModel(types.ProviderOpenAI, "gpt-4")
-//
 //	// Create the agent
 //	myAgent := agent.NewAgent(&agent.AgentOptions{
 //	    InitialState: &agent.AgentState{
 //	        SystemPrompt: "You are a helpful assistant.",
-//	        Model:        model,
+//	        Model:        provider,
+//	        ModelName:    "gpt-4o",
 //	        Tools:        tools,
 //	    },
 //	})
@@ -60,37 +64,32 @@
 //	unsubscribe := myAgent.Subscribe(func(e agent.AgentEvent) {
 //	    switch ev := e.(type) {
 //	    case agent.MessageUpdate:
-//	        if delta, ok := ev.AssistantMessageEvent.(types.EventTextDelta); ok {
+//	        if delta, ok := ev.Event.(agent.EventTextDelta); ok {
 //	            fmt.Print(delta.Delta)
 //	        }
 //	    }
 //	})
 //	defer unsubscribe()
 //
-//	// Send a prompt
-//	myAgent.Prompt("What's the weather in Tokyo?")
-//
-//	// Wait for completion
+//	// Send a prompt and wait
+//	myAgent.Prompt(context.Background(), "What's the weather in Tokyo?")
 //	<-myAgent.WaitForIdle()
 //
 // # Core Concepts
 //
 // ## Agent
 //
-// The [Agent] struct is the main interface for interacting with the agent loop.
-// It manages conversation state, handles events, and provides methods for
-// sending prompts, steering, and follow-up messages.
+// The [Agent] struct manages conversation state, handles events, and provides
+// methods for sending prompts, steering, and follow-up messages.
 //
 // ## Tools
 //
 // Tools are defined using [AgentTool], which combines a schema (name, description,
-// parameters) with an Execute function. When the LLM decides to use a tool,
-// the Execute function is called with the parsed arguments.
+// parameters) with an Execute function.
 //
 // ## Events
 //
-// The agent emits events during execution through the [AgentEvent] interface.
-// Events include:
+// The agent emits events during execution through the [AgentEvent] interface:
 //   - [AgentStart] / [AgentEnd]: Agent lifecycle events
 //   - [TurnStart] / [TurnEnd]: Turn lifecycle events
 //   - [MessageStart] / [MessageUpdate] / [MessageEnd]: Message streaming events
@@ -98,7 +97,6 @@
 //
 // ## Steering and Follow-up
 //
-// The agent supports two mechanisms for injecting messages during execution:
 //   - Steering: Interrupt the agent mid-execution (e.g., during tool calls)
 //   - Follow-up: Queue messages to be processed after the current execution
 //
@@ -109,9 +107,8 @@
 //
 // # Dependencies
 //
-// This package depends on [github.com/rahulSailesh-shah/go-pi-ai] for:
-//   - Provider abstraction ([provider.Provider])
-//   - Type definitions ([types.Message], [types.Tool], etc.)
+// This package depends on [github.com/rahulSailesh-shah/go-pi-ai] for the
+// Provider interface and core types (Message, Tool, Content, etc.).
 //
 // See the examples directory for complete working examples.
 package agent

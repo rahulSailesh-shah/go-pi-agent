@@ -4,47 +4,36 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
-	"github.com/rahulSailesh-shah/go-pi-ai/types"
+	gopiai "github.com/rahulSailesh-shah/go-pi-ai"
 )
 
-// sendEvent safely sends an event to the channel, respecting context cancellation.
-// Returns ctx.Err() if context is cancelled before send completes.
-func sendEvent(ctx context.Context, ch chan<- AgentEvent, event AgentEvent) error {
+// sendEvent sends an event to the channel, returning false if the context is cancelled.
+func sendEvent(ctx context.Context, events chan<- AgentEvent, event AgentEvent) bool {
 	select {
-	case ch <- event:
-		return nil
+	case events <- event:
+		return true
 	case <-ctx.Done():
-		return ctx.Err()
+		return false
 	}
 }
 
-// AgentLoop starts an agent loop with a new prompt message.
-// This is the low-level API for running an agent. For most use cases,
-// prefer using the Agent struct's Prompt method instead.
-//
-// The prompts are added to the context and events are emitted for them.
-// The returned AgentEventStream provides channels for events, results, and errors.
-//
-// Example:
-//
-//	stream := AgentLoop(ctx, prompts, agentContext, config)
-//	for event := range stream.Events {
-//	    // Handle events
-//	}
-//	result := <-stream.Result
-func AgentLoop(ctx context.Context, prompts []AgentMessage, agentContext AgentContext,
-	config AgentLoopConfig) AgentEventStream {
+// AgentLoop starts an agent loop with new prompt messages.
+// This is the low-level API. For most use cases, prefer the Agent struct.
+// The returned Stream must be consumed with Recv() and closed with Close().
+func AgentLoop(ctx context.Context, prompts []Message, agentContext AgentContext,
+	config AgentLoopConfig) *Stream {
 
-	stream := newAgentEventStream()
+	stream, events := NewStream(ctx)
 
 	go func() {
-		defer close(stream.Events)
-		defer close(stream.Result)
-		defer close(stream.Err)
+		defer close(events)
 
-		newMessages := make([]AgentMessage, len(prompts))
+		sctx := stream.Context()
+
+		newMessages := make([]Message, len(prompts))
 		copy(newMessages, prompts)
 
 		currentContext := AgentContext{
@@ -53,106 +42,86 @@ func AgentLoop(ctx context.Context, prompts []AgentMessage, agentContext AgentCo
 			Tools:        agentContext.Tools,
 		}
 
-		if err := sendEvent(ctx, stream.Events, AgentStart{}); err != nil {
-			stream.Err <- err
+		if !sendEvent(sctx, events, AgentStart{}) {
 			return
 		}
-		if err := sendEvent(ctx, stream.Events, TurnStart{}); err != nil {
-			stream.Err <- err
+		if !sendEvent(sctx, events, TurnStart{}) {
 			return
 		}
 
 		for _, prompt := range prompts {
-			if err := sendEvent(ctx, stream.Events, MessageStart{Message: prompt}); err != nil {
-				stream.Err <- err
+			if !sendEvent(sctx, events, MessageStart{Message: prompt}) {
 				return
 			}
-			if err := sendEvent(ctx, stream.Events, MessageEnd{Message: prompt}); err != nil {
-				stream.Err <- err
+			if !sendEvent(sctx, events, MessageEnd{Message: prompt}) {
 				return
 			}
 		}
 
-		err := runLoop(ctx, &currentContext, &newMessages, config, stream)
-		if err != nil {
-			stream.Err <- err
+		if err := runLoop(sctx, &currentContext, &newMessages, config, events); err != nil {
+			sendEvent(sctx, events, AgentError{Error: err})
 		}
 	}()
 
 	return stream
 }
 
-// AgentLoopContinue continues an agent loop from the current context without adding a new message.
-// This is useful for retries when the context already has user message or tool results as the last message.
-//
-// Returns an error if there are no messages in the context or if the last message is from the assistant.
+// AgentLoopContinue continues an agent loop from the current context without adding new messages.
+// Useful for retries when the context already has user messages or tool results as the last message.
 func AgentLoopContinue(
 	ctx context.Context,
 	agentContext AgentContext,
 	config AgentLoopConfig,
-) (AgentEventStream, error) {
+) (*Stream, error) {
 
 	if len(agentContext.Messages) == 0 {
-		return AgentEventStream{}, errors.New("cannot continue: no messages in context")
+		return nil, errors.New("cannot continue: no messages in context")
 	}
 
 	lastMsg := agentContext.Messages[len(agentContext.Messages)-1]
 	if lastMsg.Role() == "assistant" {
-		return AgentEventStream{}, errors.New("cannot continue from message role: assistant")
+		return nil, errors.New("cannot continue from message role: assistant")
 	}
 
-	stream := newAgentEventStream()
+	stream, events := NewStream(ctx)
 
 	go func() {
-		defer close(stream.Events)
-		defer close(stream.Result)
-		defer close(stream.Err)
+		defer close(events)
 
-		newMessages := []AgentMessage{}
-		// Copy context to avoid mutating the original passed context
+		sctx := stream.Context()
+
+		newMessages := []Message{}
 		currentContext := AgentContext{
 			SystemPrompt: agentContext.SystemPrompt,
 			Messages:     agentContext.Messages,
 			Tools:        agentContext.Tools,
 		}
 
-		if err := sendEvent(ctx, stream.Events, AgentStart{}); err != nil {
-			stream.Err <- err
+		if !sendEvent(sctx, events, AgentStart{}) {
 			return
 		}
-		if err := sendEvent(ctx, stream.Events, TurnStart{}); err != nil {
-			stream.Err <- err
+		if !sendEvent(sctx, events, TurnStart{}) {
 			return
 		}
 
-		err := runLoop(ctx, &currentContext, &newMessages, config, stream)
-		if err != nil {
-			stream.Err <- err
+		if err := runLoop(sctx, &currentContext, &newMessages, config, events); err != nil {
+			sendEvent(sctx, events, AgentError{Error: err})
 		}
 	}()
 
 	return stream, nil
 }
 
-// newAgentEventStream creates a new AgentEventStream with properly initialized channels.
-func newAgentEventStream() AgentEventStream {
-	return AgentEventStream{
-		Events: make(chan AgentEvent),
-		Result: make(chan []AgentMessage, 1), // Buffered to prevent deadlock
-		Err:    make(chan error, 1),          // Buffered to prevent deadlock
-	}
-}
-
 // runLoop is the core agent execution loop that handles turns, tool calls, and steering.
 func runLoop(
 	ctx context.Context,
 	currentContext *AgentContext,
-	newMessages *[]AgentMessage,
+	newMessages *[]Message,
 	config AgentLoopConfig,
-	stream AgentEventStream,
+	events chan<- AgentEvent,
 ) error {
 	firstTurn := true
-	var pendingMessages []AgentMessage
+	var pendingMessages []Message
 
 	if config.GetSteeringMessages != nil {
 		var err error
@@ -164,12 +133,12 @@ func runLoop(
 
 	for {
 		hasMoreToolCalls := true
-		var steeringAfterTools []AgentMessage
+		var steeringAfterTools []Message
 
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
 			if !firstTurn {
-				if err := sendEvent(ctx, stream.Events, TurnStart{}); err != nil {
-					return err
+				if !sendEvent(ctx, events, TurnStart{}) {
+					return ctx.Err()
 				}
 			} else {
 				firstTurn = false
@@ -177,11 +146,11 @@ func runLoop(
 
 			if len(pendingMessages) > 0 {
 				for _, message := range pendingMessages {
-					if err := sendEvent(ctx, stream.Events, MessageStart{Message: message}); err != nil {
-						return err
+					if !sendEvent(ctx, events, MessageStart{Message: message}) {
+						return ctx.Err()
 					}
-					if err := sendEvent(ctx, stream.Events, MessageEnd{Message: message}); err != nil {
-						return err
+					if !sendEvent(ctx, events, MessageEnd{Message: message}) {
+						return ctx.Err()
 					}
 					currentContext.Messages = append(currentContext.Messages, message)
 					*newMessages = append(*newMessages, message)
@@ -189,7 +158,7 @@ func runLoop(
 				pendingMessages = nil
 			}
 
-			message, err := streamAssistantResponse(ctx, currentContext, config, stream)
+			message, err := streamAssistantResponse(ctx, currentContext, config, events)
 			if err != nil {
 				return err
 			}
@@ -197,20 +166,18 @@ func runLoop(
 			*newMessages = append(*newMessages, message)
 			currentContext.Messages = append(currentContext.Messages, message)
 
-			var toolCalls []types.ToolCall
-
-			for _, c := range getContents(message) {
-				switch t := c.(type) {
-				case types.ToolCall:
-					toolCalls = append(toolCalls, t)
+			var toolCalls []gopiai.ToolCall
+			for _, c := range message.GetContents() {
+				if tc, ok := c.(gopiai.ToolCall); ok {
+					toolCalls = append(toolCalls, tc)
 				}
 			}
 
 			hasMoreToolCalls = len(toolCalls) > 0
-			var toolResults []AgentToolResult
+			var toolResults []ToolMessage
 
 			if hasMoreToolCalls {
-				executionResults, err := executeToolCalls(ctx, currentContext.Tools, toolCalls, stream,
+				executionResults, err := executeToolCalls(ctx, currentContext.Tools, toolCalls, events,
 					config.GetSteeringMessages)
 				if err != nil {
 					return err
@@ -225,8 +192,8 @@ func runLoop(
 				}
 			}
 
-			if err := sendEvent(ctx, stream.Events, TurnEnd{Message: message, ToolResults: toolResults}); err != nil {
-				return err
+			if !sendEvent(ctx, events, TurnEnd{Message: message, ToolResults: toolResults}) {
+				return ctx.Err()
 			}
 
 			if len(steeringAfterTools) > 0 {
@@ -255,171 +222,115 @@ func runLoop(
 		break
 	}
 
-	if err := sendEvent(ctx, stream.Events, AgentEnd{Messages: *newMessages}); err != nil {
-		return err
-	}
-
-	// Send result - use select to handle cancellation
-	select {
-	case stream.Result <- *newMessages:
-	case <-ctx.Done():
+	if !sendEvent(ctx, events, AgentEnd{Messages: *newMessages}) {
 		return ctx.Err()
 	}
 
 	return nil
 }
 
-// getContents extracts the content slice from a message.
-func getContents(msg AgentMessage) []types.Content {
-	switch m := msg.(type) {
-	case types.UserMessage:
-		return m.Contents
-	case types.AssistantMessage:
-		return m.Contents
-	case types.ToolMessage:
-		return m.Contents
-	default:
-		return nil
-	}
-}
-
-// streamAssistantResponse streams the LLM response and emits appropriate events.
+// streamAssistantResponse streams the LLM response and emits events.
 func streamAssistantResponse(
 	ctx context.Context,
 	currentContext *AgentContext,
 	config AgentLoopConfig,
-	stream AgentEventStream,
-) (AgentMessage, error) {
-	var tools []types.Tool
+	events chan<- AgentEvent,
+) (Message, error) {
+	var tools []gopiai.Tool
 	for _, t := range currentContext.Tools {
 		tools = append(tools, t.Tool)
 	}
 
-	llmContext := types.Context{
+	req := gopiai.Request{
+		Model:        config.ModelName,
 		SystemPrompt: currentContext.SystemPrompt,
 		Messages:     currentContext.Messages,
 		Tools:        tools,
 	}
 
-	responseStream := config.Model.Stream(ctx, llmContext)
+	llmStream, err := config.Model.Stream(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start stream: %w", err)
+	}
+	defer llmStream.Close()
 
 	messageStarted := false
+	var finalMessage gopiai.AssistantMessage
 
-Loop:
 	for {
-		select {
-		case event, ok := <-responseStream.Events:
-			if !ok {
-				break Loop
+		event, err := llmStream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		var partial Message
+		switch e := event.(type) {
+		case gopiai.EventStart:
+			continue
+		case gopiai.EventTextStart:
+			partial = e.Partial
+		case gopiai.EventTextDelta:
+			partial = e.Partial
+		case gopiai.EventTextEnd:
+			partial = e.Partial
+		case gopiai.EventToolcallStart:
+			partial = e.Partial
+		case gopiai.EventToolcallDelta:
+			partial = e.Partial
+		case gopiai.EventToolcallEnd:
+			partial = e.Partial
+		case gopiai.EventDone:
+			finalMessage = e.Message
+			partial = e.Message
+		default:
+			continue
+		}
+
+		if !messageStarted {
+			if !sendEvent(ctx, events, MessageStart{Message: partial}) {
+				return nil, ctx.Err()
 			}
+			messageStarted = true
+		}
 
-			switch e := event.(type) {
-			case types.AssistantMessageEvent:
-				var partial AgentMessage
-				switch inner := e.(type) {
-				case types.EventTextStart:
-					partial = inner.Partial
-				case types.EventTextDelta:
-					partial = inner.Partial
-				case types.EventTextEnd:
-					partial = inner.Partial
-				case types.EventToolcallStart:
-					partial = inner.Partial
-				case types.EventToolcallDelta:
-					partial = inner.Partial
-				case types.EventToolcallEnd:
-					partial = inner.Partial
-				case types.EventDone:
-					partial = inner.Message
-				case types.EventError:
-					partial = inner.Error
-				}
-
-				// Send MessageStart on first AssistantMessageEvent
-				if !messageStarted {
-					if err := sendEvent(ctx, stream.Events, MessageStart{Message: partial}); err != nil {
-						return nil, err
-					}
-					messageStarted = true
-				}
-
-				// Send MessageUpdate for all events after MessageStart
-				if err := sendEvent(ctx, stream.Events, MessageUpdate{
-					AssistantMessageEvent: e,
-					Message:               partial,
-				}); err != nil {
-					return nil, err
-				}
-
-				switch e.(type) {
-				case types.EventDone, types.EventError:
-					break Loop
-				}
-			default:
-				if ae, ok := event.(AgentEvent); ok {
-					if err := sendEvent(ctx, stream.Events, ae); err != nil {
-						return nil, err
-					}
-				}
-			}
-
-		case <-ctx.Done():
+		if !sendEvent(ctx, events, MessageUpdate{Event: event, Message: partial}) {
 			return nil, ctx.Err()
 		}
 	}
 
-	// Wait for final result with cancellation support
-	var finalMessage AgentMessage
-	select {
-	case finalMessage = <-responseStream.Result:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	// Check for errors
-	select {
-	case err := <-responseStream.Err:
-		if err != nil {
-			return nil, err
-		}
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	// Send MessageEnd with the final complete message
-	// If we never started (no events), send both start and end
-	if !messageStarted {
-		if err := sendEvent(ctx, stream.Events, MessageStart{Message: finalMessage}); err != nil {
-			return nil, err
+	if finalMessage.GetContents() == nil && !messageStarted {
+		if !sendEvent(ctx, events, MessageStart{Message: finalMessage}) {
+			return nil, ctx.Err()
 		}
 	}
-	if err := sendEvent(ctx, stream.Events, MessageEnd{Message: finalMessage}); err != nil {
-		return nil, err
+
+	if !sendEvent(ctx, events, MessageEnd{Message: finalMessage}) {
+		return nil, ctx.Err()
 	}
 
 	return finalMessage, nil
 }
 
-// executionResult holds the results of tool execution along with any steering messages.
 type executionResult struct {
-	ToolResults      []AgentToolResult
-	SteeringMessages []AgentMessage
+	ToolResults      []ToolMessage
+	SteeringMessages []Message
 }
 
-// executeToolCalls executes a list of tool calls and returns the results.
 func executeToolCalls(
 	ctx context.Context,
 	tools []AgentTool,
-	toolCalls []types.ToolCall,
-	stream AgentEventStream,
-	getSteeringMessages func() ([]AgentMessage, error),
+	toolCalls []gopiai.ToolCall,
+	events chan<- AgentEvent,
+	getSteeringMessages func() ([]Message, error),
 ) (executionResult, error) {
 
-	var results []AgentToolResult
-	var steeringMessages []AgentMessage
+	var results []ToolMessage
+	var steeringMessages []Message
 
 	for i, toolCall := range toolCalls {
-		// Check for cancellation before each tool
 		select {
 		case <-ctx.Done():
 			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, ctx.Err()
@@ -435,15 +346,15 @@ func executeToolCalls(
 			}
 		}
 
-		if err := sendEvent(ctx, stream.Events, ToolExecutionStart{
-			ToolCallId: toolCall.ID,
+		if !sendEvent(ctx, events, ToolExecutionStart{
+			ToolCallID: toolCall.ID,
 			ToolName:   toolCall.Name,
 			Args:       toolCall.Arguments,
-		}); err != nil {
-			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, err
+		}) {
+			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, ctx.Err()
 		}
 
-		var result AgentToolResult
+		var result ToolMessage
 		var isError bool
 
 		if tool == nil {
@@ -459,22 +370,22 @@ func executeToolCalls(
 			}
 		}
 
-		if err := sendEvent(ctx, stream.Events, ToolExecutionEnd{
-			ToolCallId: toolCall.ID,
+		if !sendEvent(ctx, events, ToolExecutionEnd{
+			ToolCallID: toolCall.ID,
 			ToolName:   toolCall.Name,
 			Result:     result,
 			IsError:    isError,
-		}); err != nil {
-			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, err
+		}) {
+			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, ctx.Err()
 		}
 
 		results = append(results, result)
 
-		if err := sendEvent(ctx, stream.Events, MessageStart{Message: result}); err != nil {
-			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, err
+		if !sendEvent(ctx, events, MessageStart{Message: result}) {
+			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, ctx.Err()
 		}
-		if err := sendEvent(ctx, stream.Events, MessageEnd{Message: result}); err != nil {
-			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, err
+		if !sendEvent(ctx, events, MessageEnd{Message: result}) {
+			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, ctx.Err()
 		}
 
 		if getSteeringMessages != nil {
@@ -483,11 +394,10 @@ func executeToolCalls(
 				steeringMessages = steering
 				remaining := toolCalls[i+1:]
 				for _, skipped := range remaining {
-					skippedResult, err := skipToolCall(ctx, skipped, stream)
-					if err != nil {
+					if err := skipToolCall(ctx, skipped, events); err != nil {
 						return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, err
 					}
-					results = append(results, skippedResult)
+					results = append(results, createErrorToolResult(skipped.ID, skipped.Name, "Skipped due to queued user message."))
 				}
 				break
 			}
@@ -497,45 +407,43 @@ func executeToolCalls(
 	return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, nil
 }
 
-// skipToolCall creates an error result for a skipped tool call.
-func skipToolCall(ctx context.Context, toolCall types.ToolCall, stream AgentEventStream) (AgentToolResult, error) {
+func skipToolCall(ctx context.Context, toolCall gopiai.ToolCall, events chan<- AgentEvent) error {
 	result := createErrorToolResult(toolCall.ID, toolCall.Name, "Skipped due to queued user message.")
 
-	if err := sendEvent(ctx, stream.Events, ToolExecutionStart{
-		ToolCallId: toolCall.ID,
+	if !sendEvent(ctx, events, ToolExecutionStart{
+		ToolCallID: toolCall.ID,
 		ToolName:   toolCall.Name,
 		Args:       toolCall.Arguments,
-	}); err != nil {
-		return result, err
+	}) {
+		return ctx.Err()
 	}
 
-	if err := sendEvent(ctx, stream.Events, ToolExecutionEnd{
-		ToolCallId: toolCall.ID,
+	if !sendEvent(ctx, events, ToolExecutionEnd{
+		ToolCallID: toolCall.ID,
 		ToolName:   toolCall.Name,
 		Result:     result,
 		IsError:    true,
-	}); err != nil {
-		return result, err
+	}) {
+		return ctx.Err()
 	}
 
-	if err := sendEvent(ctx, stream.Events, MessageStart{Message: result}); err != nil {
-		return result, err
+	if !sendEvent(ctx, events, MessageStart{Message: result}) {
+		return ctx.Err()
 	}
-	if err := sendEvent(ctx, stream.Events, MessageEnd{Message: result}); err != nil {
-		return result, err
+	if !sendEvent(ctx, events, MessageEnd{Message: result}) {
+		return ctx.Err()
 	}
 
-	return result, nil
+	return nil
 }
 
-// createErrorToolResult creates a tool result indicating an error.
-func createErrorToolResult(id, name, text string) AgentToolResult {
-	return types.ToolMessage{
-		ToolCallId: id,
+func createErrorToolResult(id, name, text string) ToolMessage {
+	return gopiai.ToolMessage{
+		ToolCallID: id,
 		ToolName:   name,
 		Timestamp:  time.Now(),
-		Contents: []types.Content{
-			types.TextContent{Text: text},
+		Contents: []gopiai.Content{
+			gopiai.TextContent{Text: text},
 		},
 		IsError: true,
 	}

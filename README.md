@@ -2,7 +2,7 @@
 
 A Go framework for building AI agents with tool execution, streaming responses, and event-driven architecture.
 
-> **Inspired by [pi-mono](https://github.com/badlogic/pi-mono)** - This project is a Go implementation inspired by Mario Zechner's excellent TypeScript AI agent toolkit. Full credit to [@badlogic](https://github.com/badlogic) for the original architecture and design patterns.
+> **Inspired by [pi-mono](https://github.com/badlogic/pi-mono)** - A Go implementation inspired by Mario Zechner's excellent TypeScript AI agent toolkit.
 
 ## Overview
 
@@ -15,7 +15,7 @@ A Go framework for building AI agents with tool execution, streaming responses, 
 - **Event-Driven Architecture**: Subscribe to events for fine-grained control over agent behavior
 - **Steering and Follow-up**: Interrupt or queue messages during agent execution
 - **Thread-Safe**: Safe for concurrent access from multiple goroutines
-- **Provider Agnostic**: Works with multiple LLM providers (OpenAI, NVIDIA, etc.)
+- **Provider Agnostic**: Works with any [gopiai](https://github.com/rahulSailesh-shah/go-pi-ai) provider (OpenAI, NVIDIA, etc.)
 
 ## Installation
 
@@ -29,19 +29,28 @@ go get github.com/rahulSailesh-shah/go-pi-agent
 package main
 
 import (
+    "context"
     "fmt"
+    "os"
     "time"
 
     agent "github.com/rahulSailesh-shah/go-pi-agent"
-    "github.com/rahulSailesh-shah/go-pi-ai/provider"
-    "github.com/rahulSailesh-shah/go-pi-ai/types"
+    "github.com/rahulSailesh-shah/go-pi-ai/openai"
 )
 
 func main() {
+    // Create a provider
+    provider, err := openai.NewProvider(openai.Config{
+        APIKey: os.Getenv("OPENAI_API_KEY"),
+    })
+    if err != nil {
+        panic(err)
+    }
+
     // Define tools
     tools := []agent.AgentTool{
         {
-            Tool: types.Tool{
+            Tool: agent.Tool{
                 Name:        "getWeather",
                 Description: "Get the weather for a location",
                 Parameters: map[string]any{
@@ -52,29 +61,24 @@ func main() {
                     "required": []string{"location"},
                 },
             },
-            Execute: func(toolCallId string, params map[string]any) (agent.AgentToolResult, error) {
+            Execute: func(toolCallID string, params map[string]any) (agent.ToolMessage, error) {
                 location := params["location"].(string)
-                return types.ToolMessage{
-                    ToolCallId: toolCallId,
+                return agent.ToolMessage{
+                    ToolCallID: toolCallID,
                     ToolName:   "getWeather",
-                    Contents:   []types.Content{types.TextContent{Text: fmt.Sprintf("Weather in %s: Sunny, 72F", location)}},
+                    Contents:   []agent.Content{agent.TextContent{Text: fmt.Sprintf("Weather in %s: Sunny, 72F", location)}},
                     Timestamp:  time.Now(),
                 }, nil
             },
         },
     }
 
-    // Get a model provider
-    model, err := provider.GetModel(types.ProviderOpenAI, "gpt-4")
-    if err != nil {
-        panic(err)
-    }
-
     // Create the agent
     myAgent := agent.NewAgent(&agent.AgentOptions{
         InitialState: &agent.AgentState{
             SystemPrompt: "You are a helpful assistant.",
-            Model:        model,
+            Model:        provider,
+            ModelName:    "gpt-4o",
             Tools:        tools,
         },
     })
@@ -83,7 +87,7 @@ func main() {
     unsubscribe := myAgent.Subscribe(func(e agent.AgentEvent) {
         switch ev := e.(type) {
         case agent.MessageUpdate:
-            if delta, ok := ev.AssistantMessageEvent.(types.EventTextDelta); ok {
+            if delta, ok := ev.Event.(agent.EventTextDelta); ok {
                 fmt.Print(delta.Delta)
             }
         case agent.AgentEnd:
@@ -92,13 +96,11 @@ func main() {
     })
     defer unsubscribe()
 
-    // Send a prompt
-    err = myAgent.Prompt("What's the weather in Tokyo?")
+    // Send a prompt and wait for completion
+    err = myAgent.Prompt(context.Background(), "What's the weather in Tokyo?")
     if err != nil {
         panic(err)
     }
-
-    // Wait for completion
     <-myAgent.WaitForIdle()
 }
 ```
@@ -107,32 +109,22 @@ func main() {
 
 ### Agent
 
-The `Agent` struct is the main interface for interacting with the agent loop. It provides:
-
-- State management (system prompt, model, tools, messages)
-- Event subscription for streaming
-- Lifecycle control (prompt, abort, reset)
-- Steering and follow-up message queuing
+The `Agent` struct is the main interface for interacting with the agent loop:
 
 ```go
-// Create an agent
 myAgent := agent.NewAgent(&agent.AgentOptions{
     InitialState: &agent.AgentState{
         SystemPrompt: "You are a helpful assistant.",
-        Model:        model,
+        Model:        provider,
+        ModelName:    "gpt-4o",
         Tools:        tools,
     },
     SteeringMode: "one-at-a-time",  // or "all"
     FollowUpMode: "one-at-a-time",  // or "all"
 })
 
-// Send a prompt
-myAgent.Prompt("Hello!")
-
-// Wait for completion
+myAgent.Prompt(ctx, "Hello!")
 <-myAgent.WaitForIdle()
-
-// Get the final state
 state := myAgent.State()
 ```
 
@@ -142,33 +134,25 @@ Tools are defined using `AgentTool`, which combines a JSON schema with an execut
 
 ```go
 tool := agent.AgentTool{
-    Tool: types.Tool{
+    Tool: agent.Tool{
         Name:        "searchDatabase",
         Description: "Search the database for records",
         Parameters: map[string]any{
             "type": "object",
             "properties": map[string]any{
-                "query": map[string]string{
-                    "type":        "string",
-                    "description": "The search query",
-                },
-                "limit": map[string]any{
-                    "type":        "integer",
-                    "description": "Maximum results to return",
-                    "default":     10,
-                },
+                "query": map[string]string{"type": "string"},
             },
             "required": []string{"query"},
         },
     },
-    Label: "Database Search",  // Optional human-readable label
-    Execute: func(toolCallId string, params map[string]any) (agent.AgentToolResult, error) {
+    Label: "Database Search",
+    Execute: func(toolCallID string, params map[string]any) (agent.ToolMessage, error) {
         query := params["query"].(string)
         // Execute the search...
-        return types.ToolMessage{
-            ToolCallId: toolCallId,
+        return agent.ToolMessage{
+            ToolCallID: toolCallID,
             ToolName:   "searchDatabase",
-            Contents:   []types.Content{types.TextContent{Text: "Found 5 results..."}},
+            Contents:   []agent.Content{agent.TextContent{Text: "Found 5 results..."}},
             Timestamp:  time.Now(),
         }, nil
     },
@@ -186,24 +170,19 @@ unsubscribe := myAgent.Subscribe(func(e agent.AgentEvent) {
         fmt.Println("Agent started")
     case agent.TurnStart:
         fmt.Println("Turn started")
-    case agent.MessageStart:
-        fmt.Println("Message started")
     case agent.MessageUpdate:
-        // Handle streaming content
-        switch inner := ev.AssistantMessageEvent.(type) {
-        case types.EventTextDelta:
+        switch inner := ev.Event.(type) {
+        case agent.EventTextDelta:
             fmt.Print(inner.Delta)
-        case types.EventToolcallStart:
-            fmt.Printf("Calling tool: %s\n", inner.ToolCall.Name)
+        case agent.EventToolcallStart:
+            fmt.Println("Tool call started")
+        case agent.EventDone:
+            fmt.Printf("Done (reason: %s)\n", inner.Reason)
         }
-    case agent.MessageEnd:
-        fmt.Println("Message complete")
     case agent.ToolExecutionStart:
         fmt.Printf("Executing tool: %s\n", ev.ToolName)
     case agent.ToolExecutionEnd:
         fmt.Printf("Tool result: %v\n", ev.Result)
-    case agent.TurnEnd:
-        fmt.Println("Turn ended")
     case agent.AgentEnd:
         fmt.Printf("Agent finished with %d messages\n", len(ev.Messages))
     }
@@ -217,14 +196,14 @@ Interrupt or queue messages during execution:
 
 ```go
 // Steering: Interrupt mid-execution (e.g., during tool calls)
-myAgent.Steer(types.UserMessage{
-    Contents: []types.Content{types.TextContent{Text: "Actually, cancel that and do this instead..."}},
+myAgent.Steer(agent.UserMessage{
+    Contents:  []agent.Content{agent.TextContent{Text: "Actually, cancel that and do this instead..."}},
     Timestamp: time.Now(),
 })
 
 // Follow-up: Queue for after current execution completes
-myAgent.FollowUp(types.UserMessage{
-    Contents: []types.Content{types.TextContent{Text: "Now do this next thing..."}},
+myAgent.FollowUp(agent.UserMessage{
+    Contents:  []agent.Content{agent.TextContent{Text: "Now do this next thing..."}},
     Timestamp: time.Now(),
 })
 ```
@@ -234,40 +213,52 @@ myAgent.FollowUp(types.UserMessage{
 For advanced use cases, use `AgentLoop` directly:
 
 ```go
-ctx := context.Background()
+stream := agent.AgentLoop(ctx, prompts, agentContext, agent.AgentLoopConfig{
+    Model:     provider,
+    ModelName: "gpt-4o",
+    GetSteeringMessages: func() ([]agent.Message, error) { return nil, nil },
+    GetFollowUpMessages: func() ([]agent.Message, error) { return nil, nil },
+})
+defer stream.Close()
 
-agentContext := agent.AgentContext{
-    SystemPrompt: "You are a helpful assistant.",
-    Messages:     prompts,
-    Tools:        tools,
-}
-
-config := agent.AgentLoopConfig{
-    Model: model,
-    GetSteeringMessages: func() ([]agent.AgentMessage, error) {
-        return nil, nil
-    },
-    GetFollowUpMessages: func() ([]agent.AgentMessage, error) {
-        return nil, nil
-    },
-}
-
-stream := agent.AgentLoop(ctx, prompts, agentContext, config)
-
-// Process events
-for event := range stream.Events {
+for {
+    event, err := stream.Recv()
+    if err == io.EOF {
+        break
+    }
+    if err != nil {
+        log.Fatal(err)
+    }
     // Handle events...
 }
+```
 
-// Get result
-result := <-stream.Result
+## Using with Different Providers
+
+Any [gopiai](https://github.com/rahulSailesh-shah/go-pi-ai) provider works:
+
+```go
+// OpenAI (default)
+provider, _ := openai.NewProvider(openai.Config{
+    APIKey: os.Getenv("OPENAI_API_KEY"),
+})
+
+// NVIDIA
+provider, _ := openai.NewProvider(openai.Config{
+    APIKey:  os.Getenv("NVIDIA_API_KEY"),
+    BaseURL: "https://integrate.api.nvidia.com/v1",
+})
+
+// Any OpenAI-compatible endpoint
+provider, _ := openai.NewProvider(openai.Config{
+    APIKey:  "key",
+    BaseURL: "https://my-endpoint.com/v1",
+})
 ```
 
 ## Configuration
 
 ### Environment Variables
-
-The underlying `go-pi-ai` package uses environment variables for provider configuration:
 
 ```bash
 # OpenAI
@@ -283,56 +274,35 @@ NVIDIA_API_KEY=your-api-key
 agent.NewAgent(&agent.AgentOptions{
     InitialState: &agent.AgentState{
         SystemPrompt: "...",
-        Model:        model,
+        Model:        provider,
+        ModelName:    "gpt-4o",
         Tools:        tools,
         Messages:     existingMessages,  // Optional: restore conversation
     },
-    
-    // Message processing modes
-    SteeringMode: "one-at-a-time",  // Process steering messages one at a time
-    FollowUpMode: "all",            // Process all follow-up messages at once
-    
-    // Optional session identifier
-    SessionId: "session-123",
-    
-    // Optional: Custom message filtering before LLM calls
-    ConvertToLlm: func(msgs []agent.AgentMessage) ([]types.Message, error) {
-        // Filter or transform messages...
-        return msgs, nil
-    },
-    
-    // Optional: Transform context before each LLM call
-    TransformContext: func(msgs []agent.AgentMessage, ctx context.Context) ([]agent.AgentMessage, error) {
-        // Add context, filter messages, etc.
-        return msgs, nil
-    },
+    SteeringMode: "one-at-a-time",
+    FollowUpMode: "all",
+    SessionID:    "session-123",
 })
 ```
 
-## API Reference
+## Re-exported Types
 
-Full API documentation is available at [pkg.go.dev](https://pkg.go.dev/github.com/rahulSailesh-shah/go-pi-agent).
+This package re-exports all core types from [gopiai](https://github.com/rahulSailesh-shah/go-pi-ai) so consumers typically only need to import the `agent` package:
+
+- `agent.Message`, `agent.Content`, `agent.TextContent`, `agent.ImageContent`, `agent.ToolCall`
+- `agent.UserMessage`, `agent.AssistantMessage`, `agent.ToolMessage`
+- `agent.Tool`, `agent.Request`, `agent.Provider`
+- `agent.Event`, `agent.EventTextDelta`, `agent.EventDone`, etc.
+- `agent.StopReasonStop`, `agent.StopReasonToolUse`, etc.
 
 ## Examples
 
-See the [examples](./examples) directory for complete working examples:
-
-- [basic](./examples/basic) - Basic usage with both high-level and low-level APIs
+See the [examples](./examples) directory for complete working examples.
 
 ## Dependencies
 
-- [go-pi-ai](https://github.com/rahulSailesh-shah/go-pi-ai) - LLM provider abstraction
+- [go-pi-ai](https://github.com/rahulSailesh-shah/go-pi-ai) v0.2.1 - LLM provider abstraction
 
 ## License
 
 MIT License - see [LICENSE](./LICENSE) for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues and pull requests.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
