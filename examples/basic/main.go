@@ -142,7 +142,7 @@ func RunAgentExample() {
 	defer unsubscribe()
 
 	fmt.Println("=== Sending prompt: What is the weather in Tokyo, Japan? ===")
-	err := myAgent.Prompt(context.Background(), "What is the weather in Tokyo, Japan?")
+	err := myAgent.Prompt(context.Background(), "What is the weather in Tokyo, Japan? and based on the weather, what is the best activity to do in Tokyo?")
 	if err != nil {
 		log.Fatalf("Failed to send prompt: %v", err)
 	}

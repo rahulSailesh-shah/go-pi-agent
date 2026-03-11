@@ -4,7 +4,7 @@ go 1.25.1
 
 require (
 	github.com/joho/godotenv v1.5.1
-	github.com/rahulSailesh-shah/go-pi-ai v0.2.1
+	github.com/rahulSailesh-shah/go-pi-ai v0.2.2
 )
 
 require (
