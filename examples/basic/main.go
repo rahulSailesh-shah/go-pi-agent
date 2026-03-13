@@ -32,8 +32,8 @@ func init() {
 // getProvider creates an OpenAI-compatible provider.
 func getProvider() agent.Provider {
 	provider, err := openai.NewProvider(openai.Config{
-		APIKey:  os.Getenv("NVIDIA_API_KEY"),
-		BaseURL: "https://integrate.api.nvidia.com/v1",
+		APIKey:  os.Getenv("CEREBRAS_API_KEY"),
+		BaseURL: os.Getenv("CEREBRAS_BASE_URL"),
 	})
 	if err != nil {
 		log.Fatalf("Failed to create provider: %v", err)
@@ -115,7 +115,7 @@ func RunAgentExample() {
 		InitialState: &agent.AgentState{
 			SystemPrompt: "You are a helpful assistant. Answer the user's query and use tools if needed.",
 			Model:        getProvider(),
-			ModelName:    "openai/gpt-oss-20b",
+			ModelName:    "gpt-oss-120b",
 			Tools:        tools,
 		},
 		SteeringMode: "one-at-a-time",

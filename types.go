@@ -35,7 +35,6 @@ type (
 	EventToolcallDelta = gopiai.EventToolcallDelta
 	EventToolcallEnd   = gopiai.EventToolcallEnd
 	EventDone          = gopiai.EventDone
-	EventError         = gopiai.EventError
 )
 
 // Re-export gopiai stop reason constants.
