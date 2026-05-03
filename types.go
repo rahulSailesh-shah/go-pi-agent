@@ -71,24 +71,14 @@ type AgentContext struct {
 
 // AgentLoopConfig configures the behavior of the agent loop.
 type AgentLoopConfig struct {
-	// Model is the LLM provider used for generating responses.
-	Model gopiai.Provider
+	// Provider is the LLM provider used for generating responses.
+	Provider gopiai.Provider
 
 	// ModelName is the model identifier (e.g. "gpt-4o").
 	ModelName string
 
 	// SessionID is an optional identifier for the conversation session.
 	SessionID string
-
-	// GetSteeringMessages is called during execution to check for steering messages.
-	// Steering messages can interrupt tool execution to redirect the agent.
-	// Return nil if no steering messages are available.
-	GetSteeringMessages func() ([]Message, error)
-
-	// GetFollowUpMessages is called after the agent completes to check for follow-up messages.
-	// Follow-up messages are processed in a new turn after the current execution completes.
-	// Return nil if no follow-up messages are available.
-	GetFollowUpMessages func() ([]Message, error)
 }
 
 // Stream provides an iterator-based API for consuming agent events.
@@ -232,7 +222,7 @@ func (e ToolExecutionStart) Type() string { return "tool_execution_start" }
 type ToolExecutionEnd struct {
 	ToolCallID string
 	ToolName   string
-	Result     any
+	Result     ToolMessage
 	IsError    bool
 }
 

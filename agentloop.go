@@ -30,7 +30,6 @@ func AgentLoop(ctx context.Context, prompts []Message, agentContext AgentContext
 
 	go func() {
 		defer close(events)
-
 		sctx := stream.Context()
 
 		newMessages := make([]Message, len(prompts))
@@ -48,7 +47,6 @@ func AgentLoop(ctx context.Context, prompts []Message, agentContext AgentContext
 		if !sendEvent(sctx, events, TurnStart{}) {
 			return
 		}
-
 		for _, prompt := range prompts {
 			if !sendEvent(sctx, events, MessageStart{Message: prompt}) {
 				return
@@ -58,9 +56,7 @@ func AgentLoop(ctx context.Context, prompts []Message, agentContext AgentContext
 			}
 		}
 
-		if err := runLoop(sctx, &currentContext, &newMessages, config, events); err != nil {
-			sendEvent(sctx, events, AgentError{Error: err})
-		}
+		runAgentLoop(sctx, &currentContext, &newMessages, config, events)
 	}()
 
 	return stream
@@ -78,8 +74,7 @@ func AgentLoopContinue(
 		return nil, errors.New("cannot continue: no messages in context")
 	}
 
-	lastMsg := agentContext.Messages[len(agentContext.Messages)-1]
-	if lastMsg.Role() == "assistant" {
+	if lastMsg := agentContext.Messages[len(agentContext.Messages)-1]; lastMsg.Role() == "assistant" {
 		return nil, errors.New("cannot continue from message role: assistant")
 	}
 
@@ -87,7 +82,6 @@ func AgentLoopContinue(
 
 	go func() {
 		defer close(events)
-
 		sctx := stream.Context()
 
 		newMessages := []Message{}
@@ -104,129 +98,79 @@ func AgentLoopContinue(
 			return
 		}
 
-		if err := runLoop(sctx, &currentContext, &newMessages, config, events); err != nil {
-			sendEvent(sctx, events, AgentError{Error: err})
-		}
+		runAgentLoop(sctx, &currentContext, &newMessages, config, events)
 	}()
 
 	return stream, nil
 }
 
-// runLoop is the core agent execution loop that handles turns, tool calls, and steering.
-func runLoop(
+// runAgentLoop drives turns to completion and emits the terminal AgentError /
+// AgentEnd events. Callers are responsible for AgentStart and the initial
+// TurnStart.
+func runAgentLoop(
+	ctx context.Context,
+	currentContext *AgentContext,
+	newMessages *[]Message,
+	config AgentLoopConfig,
+	events chan<- AgentEvent,
+) {
+	if err := runTurns(ctx, currentContext, newMessages, config, events); err != nil {
+		sendEvent(ctx, events, AgentError{Error: err})
+	}
+	sendEvent(ctx, events, AgentEnd{Messages: *newMessages})
+}
+
+// runTurns executes assistant generations until no tool calls remain or an
+// error occurs. Each iteration emits exactly one TurnEnd; if the assistant
+// requested tools, a TurnStart is emitted to open the next iteration.
+func runTurns(
 	ctx context.Context,
 	currentContext *AgentContext,
 	newMessages *[]Message,
 	config AgentLoopConfig,
 	events chan<- AgentEvent,
 ) error {
-	firstTurn := true
-	var pendingMessages []Message
-
-	if config.GetSteeringMessages != nil {
-		var err error
-		pendingMessages, err = config.GetSteeringMessages()
-		if err != nil {
-			return err
-		}
-	}
-
 	for {
-		hasMoreToolCalls := true
-		var steeringAfterTools []Message
-
-		for hasMoreToolCalls || len(pendingMessages) > 0 {
-			if !firstTurn {
-				if !sendEvent(ctx, events, TurnStart{}) {
-					return ctx.Err()
-				}
-			} else {
-				firstTurn = false
-			}
-
-			if len(pendingMessages) > 0 {
-				for _, message := range pendingMessages {
-					if !sendEvent(ctx, events, MessageStart{Message: message}) {
-						return ctx.Err()
-					}
-					if !sendEvent(ctx, events, MessageEnd{Message: message}) {
-						return ctx.Err()
-					}
-					currentContext.Messages = append(currentContext.Messages, message)
-					*newMessages = append(*newMessages, message)
-				}
-				pendingMessages = nil
-			}
-
-			message, err := streamAssistantResponse(ctx, currentContext, config, events)
-			if err != nil {
-				return err
-			}
-
+		message, err := streamAssistantResponse(ctx, currentContext, config, events)
+		if message != nil {
 			*newMessages = append(*newMessages, message)
 			currentContext.Messages = append(currentContext.Messages, message)
+		}
+		if err != nil {
+			sendEvent(ctx, events, TurnEnd{Message: message})
+			return err
+		}
 
-			var toolCalls []gopiai.ToolCall
-			for _, c := range message.GetContents() {
-				if tc, ok := c.(gopiai.ToolCall); ok {
-					toolCalls = append(toolCalls, tc)
-				}
+		var toolCalls []gopiai.ToolCall
+		for _, c := range message.GetContents() {
+			if tc, ok := c.(gopiai.ToolCall); ok {
+				toolCalls = append(toolCalls, tc)
 			}
+		}
 
-			hasMoreToolCalls = len(toolCalls) > 0
-			var toolResults []ToolMessage
-
-			if hasMoreToolCalls {
-				executionResults, err := executeToolCalls(ctx, currentContext.Tools, toolCalls, events,
-					config.GetSteeringMessages)
-				if err != nil {
-					return err
-				}
-
-				toolResults = append(toolResults, executionResults.ToolResults...)
-				steeringAfterTools = executionResults.SteeringMessages
-
-				for _, result := range toolResults {
-					currentContext.Messages = append(currentContext.Messages, result)
-					*newMessages = append(*newMessages, result)
-				}
-			}
-
-			if !sendEvent(ctx, events, TurnEnd{Message: message, ToolResults: toolResults}) {
+		if len(toolCalls) == 0 {
+			if !sendEvent(ctx, events, TurnEnd{Message: message}) {
 				return ctx.Err()
 			}
-
-			if len(steeringAfterTools) > 0 {
-				pendingMessages = steeringAfterTools
-				steeringAfterTools = nil
-			} else if config.GetSteeringMessages != nil {
-				var err error
-				pendingMessages, err = config.GetSteeringMessages()
-				if err != nil {
-					return err
-				}
-			}
+			return nil
 		}
 
-		if config.GetFollowUpMessages != nil {
-			followUpMessages, err := config.GetFollowUpMessages()
-			if err != nil {
-				return err
-			}
-			if len(followUpMessages) > 0 {
-				pendingMessages = followUpMessages
-				continue
-			}
+		toolResults, execErr := executeToolCalls(ctx, currentContext.Tools, toolCalls, events)
+		for _, r := range toolResults {
+			currentContext.Messages = append(currentContext.Messages, r)
+			*newMessages = append(*newMessages, r)
+		}
+		if !sendEvent(ctx, events, TurnEnd{Message: message, ToolResults: toolResults}) {
+			return ctx.Err()
+		}
+		if execErr != nil {
+			return execErr
 		}
 
-		break
+		if !sendEvent(ctx, events, TurnStart{}) {
+			return ctx.Err()
+		}
 	}
-
-	if !sendEvent(ctx, events, AgentEnd{Messages: *newMessages}) {
-		return ctx.Err()
-	}
-
-	return nil
 }
 
 // streamAssistantResponse streams the LLM response and emits events.
@@ -248,7 +192,7 @@ func streamAssistantResponse(
 		Tools:        tools,
 	}
 
-	llmStream, err := config.Model.Stream(ctx, req)
+	llmStream, err := config.Provider.Stream(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start stream: %w", err)
 	}
@@ -285,6 +229,9 @@ func streamAssistantResponse(
 		case gopiai.EventDone:
 			finalMessage = e.Message
 			partial = e.Message
+			if e.Err != nil {
+				return finalMessage, e.Err
+			}
 		default:
 			continue
 		}
@@ -314,26 +261,21 @@ func streamAssistantResponse(
 	return finalMessage, nil
 }
 
-type executionResult struct {
-	ToolResults      []ToolMessage
-	SteeringMessages []Message
-}
-
+// executeToolCalls runs each tool call and emits ToolExecutionStart/End. The
+// returned slice contains every result produced before the first error (if any).
 func executeToolCalls(
 	ctx context.Context,
 	tools []AgentTool,
 	toolCalls []gopiai.ToolCall,
 	events chan<- AgentEvent,
-	getSteeringMessages func() ([]Message, error),
-) (executionResult, error) {
+) ([]ToolMessage, error) {
 
 	var results []ToolMessage
-	var steeringMessages []Message
 
-	for i, toolCall := range toolCalls {
+	for _, toolCall := range toolCalls {
 		select {
 		case <-ctx.Done():
-			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, ctx.Err()
+			return results, ctx.Err()
 		default:
 		}
 
@@ -351,7 +293,7 @@ func executeToolCalls(
 			ToolName:   toolCall.Name,
 			Args:       toolCall.Arguments,
 		}) {
-			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, ctx.Err()
+			return results, ctx.Err()
 		}
 
 		var result ToolMessage
@@ -370,71 +312,19 @@ func executeToolCalls(
 			}
 		}
 
+		results = append(results, result)
+
 		if !sendEvent(ctx, events, ToolExecutionEnd{
 			ToolCallID: toolCall.ID,
 			ToolName:   toolCall.Name,
 			Result:     result,
 			IsError:    isError,
 		}) {
-			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, ctx.Err()
-		}
-
-		results = append(results, result)
-
-		if !sendEvent(ctx, events, MessageStart{Message: result}) {
-			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, ctx.Err()
-		}
-		if !sendEvent(ctx, events, MessageEnd{Message: result}) {
-			return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, ctx.Err()
-		}
-
-		if getSteeringMessages != nil {
-			steering, err := getSteeringMessages()
-			if err == nil && len(steering) > 0 {
-				steeringMessages = steering
-				remaining := toolCalls[i+1:]
-				for _, skipped := range remaining {
-					if err := skipToolCall(ctx, skipped, events); err != nil {
-						return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, err
-					}
-					results = append(results, createErrorToolResult(skipped.ID, skipped.Name, "Skipped due to queued user message."))
-				}
-				break
-			}
+			return results, ctx.Err()
 		}
 	}
 
-	return executionResult{ToolResults: results, SteeringMessages: steeringMessages}, nil
-}
-
-func skipToolCall(ctx context.Context, toolCall gopiai.ToolCall, events chan<- AgentEvent) error {
-	result := createErrorToolResult(toolCall.ID, toolCall.Name, "Skipped due to queued user message.")
-
-	if !sendEvent(ctx, events, ToolExecutionStart{
-		ToolCallID: toolCall.ID,
-		ToolName:   toolCall.Name,
-		Args:       toolCall.Arguments,
-	}) {
-		return ctx.Err()
-	}
-
-	if !sendEvent(ctx, events, ToolExecutionEnd{
-		ToolCallID: toolCall.ID,
-		ToolName:   toolCall.Name,
-		Result:     result,
-		IsError:    true,
-	}) {
-		return ctx.Err()
-	}
-
-	if !sendEvent(ctx, events, MessageStart{Message: result}) {
-		return ctx.Err()
-	}
-	if !sendEvent(ctx, events, MessageEnd{Message: result}) {
-		return ctx.Err()
-	}
-
-	return nil
+	return results, nil
 }
 
 func createErrorToolResult(id, name, text string) ToolMessage {

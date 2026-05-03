@@ -18,7 +18,7 @@ import (
 func init() {
 	if err := godotenv.Load(); err != nil {
 		dir, _ := os.Getwd()
-		for i := 0; i < 3; i++ {
+		for range 3 {
 			envPath := filepath.Join(dir, ".env")
 			if _, err := os.Stat(envPath); err == nil {
 				godotenv.Load(envPath)
@@ -32,8 +32,8 @@ func init() {
 // getProvider creates an OpenAI-compatible provider.
 func getProvider() agent.Provider {
 	provider, err := openai.NewProvider(openai.Config{
-		APIKey:  os.Getenv("CEREBRAS_API_KEY"),
-		BaseURL: os.Getenv("CEREBRAS_BASE_URL"),
+		APIKey:  os.Getenv("NVIDIA_API_KEY"),
+		BaseURL: os.Getenv("NVIDIA_BASE_URL"),
 	})
 	if err != nil {
 		log.Fatalf("Failed to create provider: %v", err)
@@ -62,10 +62,8 @@ func RunAgentLoopExample() {
 	}
 
 	config := agent.AgentLoopConfig{
-		Model:               getProvider(),
-		ModelName:           "openai/gpt-oss-20b",
-		GetSteeringMessages: func() ([]agent.Message, error) { return nil, nil },
-		GetFollowUpMessages: func() ([]agent.Message, error) { return nil, nil },
+		Provider:  getProvider(),
+		ModelName: "gpt-oss-120b",
 	}
 
 	stream := agent.AgentLoop(ctx, prompts, agentContext, config)
@@ -111,38 +109,51 @@ func RunAgentLoopExample() {
 func RunAgentExample() {
 	tools := createTools()
 
-	myAgent := agent.NewAgent(&agent.AgentOptions{
-		InitialState: &agent.AgentState{
+	myAgent := agent.NewAgent(
+		agent.WithInitialState(&agent.AgentState{
 			SystemPrompt: "You are a helpful assistant. Answer the user's query and use tools if needed.",
-			Model:        getProvider(),
-			ModelName:    "gpt-oss-120b",
+			Provider:     getProvider(),
+			ModelName:    "openai/gpt-oss-120b",
 			Tools:        tools,
-		},
-		SteeringMode: "one-at-a-time",
-		FollowUpMode: "one-at-a-time",
-	})
+		}),
+	)
 
 	unsubscribe := myAgent.Subscribe(func(e agent.AgentEvent) {
 		switch ev := e.(type) {
+		case agent.AgentStart:
+			fmt.Printf("\n>> agent_start\n")
+		case agent.TurnStart:
+			fmt.Printf("\n>> turn_start\n")
+		case agent.MessageStart:
+			fmt.Printf("\n>> message_start (role=%s)\n", ev.Message.Role())
 		case agent.MessageUpdate:
 			switch inner := ev.Event.(type) {
 			case agent.EventTextDelta:
 				fmt.Print(inner.Delta)
 			case agent.EventToolcallStart:
-				fmt.Printf("\n[Tool Call Start]\n")
+				fmt.Printf("\n   [tool_call_start]\n")
 			case agent.EventToolcallEnd:
-				fmt.Printf("\n[Tool Call End]\n")
+				fmt.Printf("\n   [tool_call_end]\n")
 			case agent.EventDone:
-				fmt.Printf("\n[Stream Done (Reason: %s)]\n", inner.Reason)
+				fmt.Printf("\n   [stream_done reason=%s]\n", inner.Reason)
 			}
+		case agent.MessageEnd:
+			fmt.Printf("\n>> message_end (role=%s)\n", ev.Message.Role())
+		case agent.ToolExecutionStart:
+			fmt.Printf("\n>> tool_execution_start (name=%s id=%s)\n", ev.ToolName, ev.ToolCallID)
+		case agent.ToolExecutionEnd:
+			fmt.Printf("\n>> tool_execution_end (name=%s id=%s isError=%t)\n", ev.ToolName, ev.ToolCallID, ev.IsError)
+		case agent.TurnEnd:
+			fmt.Printf("\n>> turn_end (toolResults=%d)\n", len(ev.ToolResults))
 		case agent.AgentEnd:
-			fmt.Printf("\n[Agent End] Messages count: %d\n", len(ev.Messages))
+			fmt.Printf("\n>> agent_end (messages=%d)\n", len(ev.Messages))
 		}
 	})
 	defer unsubscribe()
 
-	fmt.Println("=== Sending prompt: What is the weather in Tokyo, Japan? ===")
-	err := myAgent.Prompt(context.Background(), "What is the weather in Tokyo, Japan? and based on the weather, what is the best activity to do in Tokyo?")
+	fmt.Println("=== Sending prompt ===")
+	err := myAgent.Prompt(context.Background(),
+		"What is the weather in Tokyo, Japan? and based on the weather, what is the best activity to do in Tokyo? and after you are done fetch the stock price for Apple")
 	if err != nil {
 		log.Fatalf("Failed to send prompt: %v", err)
 	}
@@ -167,14 +178,14 @@ func RunAgentExample() {
 func RunAgentWithTimeoutExample() {
 	tools := createTools()
 
-	myAgent := agent.NewAgent(&agent.AgentOptions{
-		InitialState: &agent.AgentState{
+	myAgent := agent.NewAgent(
+		agent.WithInitialState(&agent.AgentState{
 			SystemPrompt: "You are a helpful assistant. Answer the user's query and use tools if needed.",
-			Model:        getProvider(),
+			Provider:     getProvider(),
 			ModelName:    "openai/gpt-oss-20b",
 			Tools:        tools,
-		},
-	})
+		}),
+	)
 
 	unsubscribe := myAgent.Subscribe(func(e agent.AgentEvent) {
 		switch ev := e.(type) {
