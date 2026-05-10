@@ -63,7 +63,7 @@ func RunAgentLoopExample() {
 
 	config := agent.AgentLoopConfig{
 		Provider:  getProvider(),
-		ModelName: "gpt-oss-120b",
+		ModelName: "nvidia/nemotron-3-nano-30b-a3b",
 	}
 
 	stream := agent.AgentLoop(ctx, prompts, agentContext, config)
@@ -113,7 +113,7 @@ func RunAgentExample() {
 		agent.WithInitialState(&agent.AgentState{
 			SystemPrompt: "You are a helpful assistant. Answer the user's query and use tools if needed.",
 			Provider:     getProvider(),
-			ModelName:    "openai/gpt-oss-120b",
+			ModelName:    "nvidia/nemotron-3-nano-30b-a3b",
 			Tools:        tools,
 		}),
 	)
@@ -182,7 +182,7 @@ func RunAgentWithTimeoutExample() {
 		agent.WithInitialState(&agent.AgentState{
 			SystemPrompt: "You are a helpful assistant. Answer the user's query and use tools if needed.",
 			Provider:     getProvider(),
-			ModelName:    "openai/gpt-oss-20b",
+			ModelName:    "nvidia/nemotron-3-nano-30b-a3b",
 			Tools:        tools,
 		}),
 	)
